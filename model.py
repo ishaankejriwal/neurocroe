@@ -1,13 +1,15 @@
+import csv
 import math
 import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import serial
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QFrame, QGridLayout, QLabel, QMainWindow, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QGridLayout, QLabel, QMainWindow, QPushButton, QWidget
 
 
 # Serial and dashboard configuration.
@@ -19,6 +21,22 @@ UPDATE_MS = 16
 CALIBRATION_SECONDS = 5.0
 MIN_CALIBRATION_SAMPLES = 20
 DISPLAY_RANGE_DEG = 30.0
+TRIAL_LOG_PATH = Path("trunk_stability_trials.csv")
+STABLE_RECOVERY_DEG = 3.0
+STABLE_RECOVERY_SECONDS = 0.5
+
+# Task-specific thresholds keep easier and harder exercises clinically separate.
+TASK_THRESHOLDS = {
+    "Quiet standing - 30 s": 6.0,
+    "Feet together standing - 30 s": 8.0,
+    "Seated unsupported hold - 30 s": 8.0,
+    "Seated leg raise - left/right": 10.0,
+    "Sit-to-stand - 5 reps": 12.0,
+    "Standing march - 10 reps": 12.0,
+}
+
+# Side labels support symmetric tasks and left/right exercise comparisons.
+SIDE_OPTIONS = ["Both / none", "Left", "Right"]
 
 
 # Stores the current calibrated brace posture for the dashboard.
@@ -33,6 +51,30 @@ class Pose:
     score: float = 0.0
     status: str = "WAITING"
     age_ms: int = 0
+
+
+# One time-stamped posture sample recorded during an assessment trial.
+@dataclass
+class TrialSample:
+    elapsed_s: float
+    relative_roll: float
+    relative_pitch: float
+    relative_mag: float
+    score: float
+
+
+# Summary metrics computed from a completed exercise trial.
+@dataclass
+class TrialMetrics:
+    duration_s: float = 0.0
+    sample_count: int = 0
+    rms_deg: float = 0.0
+    p95_deg: float = 0.0
+    peak_deg: float = 0.0
+    outside_pct: float = 0.0
+    path_deg: float = 0.0
+    velocity_deg_s: float = 0.0
+    recovery_s: float | None = None
 
 
 # Runtime serial connection; initialized in main so imports stay safe.
@@ -232,15 +274,142 @@ def compute_pose():
     )
 
 
+def percentile(values, pct):
+    # Compute a percentile without requiring NumPy for this lightweight script.
+    if not values:
+        return 0.0
+
+    sorted_values = sorted(values)
+    index = (len(sorted_values) - 1) * pct / 100.0
+    lower = math.floor(index)
+    upper = math.ceil(index)
+
+    if lower == upper:
+        return sorted_values[int(index)]
+
+    lower_weight = upper - index
+    upper_weight = index - lower
+    return sorted_values[lower] * lower_weight + sorted_values[upper] * upper_weight
+
+
+def recovery_time_after_peak(samples):
+    # Measure how long it takes to return near neutral after the largest deviation.
+    if not samples:
+        return None
+
+    peak_index = max(range(len(samples)), key=lambda i: samples[i].relative_mag)
+    peak_time = samples[peak_index].elapsed_s
+    stable_start = None
+
+    for sample in samples[peak_index:]:
+        if sample.relative_mag <= STABLE_RECOVERY_DEG:
+            if stable_start is None:
+                stable_start = sample.elapsed_s
+
+            if sample.elapsed_s - stable_start >= STABLE_RECOVERY_SECONDS:
+                return max(0.0, stable_start - peak_time)
+        else:
+            stable_start = None
+
+    return None
+
+
+def calculate_trial_metrics(samples, threshold_deg):
+    # Convert trial samples into objective trunk-over-pelvis control metrics.
+    if not samples:
+        return TrialMetrics()
+
+    duration = samples[-1].elapsed_s
+    magnitudes = [sample.relative_mag for sample in samples]
+    rms = math.sqrt(sum(value * value for value in magnitudes) / len(magnitudes))
+    p95 = percentile(magnitudes, 95)
+    peak = max(magnitudes)
+
+    outside_seconds = 0.0
+    path = 0.0
+
+    for previous, current in zip(samples, samples[1:]):
+        dt = max(0.0, current.elapsed_s - previous.elapsed_s)
+
+        if current.relative_mag > threshold_deg:
+            outside_seconds += dt
+
+        path += math.hypot(
+            current.relative_roll - previous.relative_roll,
+            current.relative_pitch - previous.relative_pitch,
+        )
+
+    outside_pct = (outside_seconds / duration * 100.0) if duration > 0 else 0.0
+    velocity = (path / duration) if duration > 0 else 0.0
+
+    return TrialMetrics(
+        duration_s=duration,
+        sample_count=len(samples),
+        rms_deg=rms,
+        p95_deg=p95,
+        peak_deg=peak,
+        outside_pct=outside_pct,
+        path_deg=path,
+        velocity_deg_s=velocity,
+        recovery_s=recovery_time_after_peak(samples),
+    )
+
+
+def append_trial_csv(task, side, threshold_deg, metrics):
+    # Persist completed trials so patient progress can be tracked over time.
+    fieldnames = [
+        "timestamp",
+        "task",
+        "side",
+        "threshold_deg",
+        "duration_s",
+        "sample_count",
+        "rms_deg",
+        "p95_deg",
+        "peak_deg",
+        "outside_pct",
+        "path_deg",
+        "velocity_deg_s",
+        "recovery_s",
+    ]
+    file_exists = TRIAL_LOG_PATH.exists()
+
+    with TRIAL_LOG_PATH.open("a", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+
+        if not file_exists:
+            writer.writeheader()
+
+        writer.writerow(
+            {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "task": task,
+                "side": side,
+                "threshold_deg": f"{threshold_deg:.1f}",
+                "duration_s": f"{metrics.duration_s:.3f}",
+                "sample_count": metrics.sample_count,
+                "rms_deg": f"{metrics.rms_deg:.3f}",
+                "p95_deg": f"{metrics.p95_deg:.3f}",
+                "peak_deg": f"{metrics.peak_deg:.3f}",
+                "outside_pct": f"{metrics.outside_pct:.3f}",
+                "path_deg": f"{metrics.path_deg:.3f}",
+                "velocity_deg_s": f"{metrics.velocity_deg_s:.3f}",
+                "recovery_s": "" if metrics.recovery_s is None else f"{metrics.recovery_s:.3f}",
+            }
+        )
+
+
 class MetricCard(QFrame):
     # Compact card for one large numeric dashboard value.
     def __init__(self, title, unit="deg"):
         super().__init__()
         self.unit = unit
         self.setObjectName("metricCard")
+        self.setMinimumHeight(104)
 
         layout = QGridLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(2)
 
         self.title_label = QLabel(title)
@@ -253,14 +422,43 @@ class MetricCard(QFrame):
         self.unit_label = QLabel(unit)
         self.unit_label.setObjectName("metricUnit")
         self.unit_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.unit_label.setMinimumWidth(34)
 
         layout.addWidget(self.title_label, 0, 0, 1, 2)
         layout.addWidget(self.value_label, 1, 0)
         layout.addWidget(self.unit_label, 1, 1)
+        layout.setColumnStretch(0, 1)
 
     def set_value(self, value):
         # Keep numeric formatting consistent across live updates.
         self.value_label.setText(f"{value:.1f}")
+
+
+class MiniMetric(QFrame):
+    # Small assessment metric tile for trial summaries.
+    def __init__(self, title, value="--"):
+        super().__init__()
+        self.setObjectName("miniMetric")
+        self.setMinimumSize(112, 42)
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setVerticalSpacing(1)
+
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("miniTitle")
+
+        self.value_label = QLabel(value)
+        self.value_label.setObjectName("miniValue")
+        self.value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        layout.addWidget(self.title_label, 0, 0)
+        layout.addWidget(self.value_label, 1, 0)
+        layout.setColumnStretch(0, 1)
+
+    def set_text(self, value):
+        # Accept preformatted strings because assessment units vary by metric.
+        self.value_label.setText(value)
 
 
 class LeanGauge(QWidget):
@@ -327,7 +525,7 @@ class BarMeter(QWidget):
         super().__init__()
         self.label = label
         self.value = 0.0
-        self.setMinimumHeight(30)
+        self.setMinimumHeight(36)
 
     def set_value(self, value):
         # Clamp displayed values to the configured dashboard range.
@@ -339,7 +537,9 @@ class BarMeter(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        rect = self.rect().adjusted(0, 7, -48, -7)
+        label_width = 158
+        value_width = 76
+        rect = self.rect().adjusted(label_width, 9, -value_width, -9)
         center_x = rect.left() + rect.width() / 2
         fill_width = abs(self.value) / DISPLAY_RANGE_DEG * (rect.width() / 2)
 
@@ -362,11 +562,15 @@ class BarMeter(QWidget):
 
         painter.setPen(QColor("#e5e7eb"))
         painter.setFont(QFont("Segoe UI", 8))
-        painter.drawText(0, 0, rect.width(), 11, Qt.AlignLeft | Qt.AlignTop, self.label)
+        painter.drawText(0, 0, label_width - 10, self.height(), Qt.AlignLeft | Qt.AlignVCenter, self.label)
 
         painter.setPen(QColor("#cbd5e1"))
         painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        painter.drawText(self.rect().adjusted(0, 0, -2, 0), Qt.AlignRight | Qt.AlignVCenter, f"{self.value:+.1f}")
+        painter.drawText(
+            self.rect().adjusted(0, 0, -14, 0),
+            Qt.AlignRight | Qt.AlignVCenter,
+            f"{self.value:+.1f}",
+        )
 
 
 class ScoreRing(QWidget):
@@ -434,8 +638,12 @@ class Dashboard(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NeuroCore Live Brace Monitor")
-        self.resize(960, 600)
-        self.setMinimumSize(820, 520)
+        self.resize(1180, 700)
+        self.setMinimumSize(980, 620)
+        self.trial_active = False
+        self.trial_start_time = 0.0
+        self.trial_samples = []
+        self.side_results = {}
 
         root = QWidget()
         root.setObjectName("root")
@@ -443,9 +651,9 @@ class Dashboard(QMainWindow):
 
         # Use a dense grid so the dashboard fits comfortably on a desktop screen.
         layout = QGridLayout(root)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setHorizontalSpacing(10)
-        layout.setVerticalSpacing(6)
+        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setHorizontalSpacing(14)
+        layout.setVerticalSpacing(10)
 
         title = QLabel("NeuroCore Live Brace Monitor")
         title.setObjectName("title")
@@ -470,6 +678,13 @@ class Dashboard(QMainWindow):
         layout.addWidget(self.relative_side, 3, 2)
         layout.addWidget(self.relative_forward, 3, 3)
 
+        self.assessment_button = QPushButton("Open Assessment Trial")
+        self.assessment_button.setObjectName("secondaryButton")
+        self.assessment_button.clicked.connect(self.show_assessment_window)
+        layout.addWidget(self.assessment_button, 5, 2, 1, 2)
+
+        self.assessment_window = self.create_assessment_window()
+
         # Individual channel meters mirror the original diagnostic bar chart.
         self.meters = [
             BarMeter("Back side lean"),
@@ -487,12 +702,215 @@ class Dashboard(QMainWindow):
         layout.setColumnStretch(1, 2)
         layout.setColumnStretch(2, 1)
         layout.setColumnStretch(3, 1)
-        layout.setRowStretch(5, 0)
+        layout.setColumnMinimumWidth(2, 260)
+        layout.setColumnMinimumWidth(3, 260)
+        layout.setRowStretch(5, 1)
 
         # The Qt timer drives live updates without blocking the UI thread.
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(UPDATE_MS)
+
+    def create_assessment_window(self):
+        # Keep assessment controls separate so the live monitor remains readable.
+        window = QWidget(self, Qt.Window)
+        window.setObjectName("assessmentRoot")
+        window.setWindowTitle("NeuroCore Assessment Trial")
+        window.resize(760, 320)
+        window.setMinimumSize(700, 300)
+
+        layout = QGridLayout(window)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.addWidget(self.create_assessment_panel(), 0, 0)
+
+        return window
+
+    def show_assessment_window(self):
+        # Reuse the same trial widgets each time the user opens the panel.
+        self.assessment_window.show()
+        self.assessment_window.raise_()
+        self.assessment_window.activateWindow()
+
+    def create_assessment_panel(self):
+        # Build task controls and metric tiles for standardized exercise trials.
+        panel = QFrame()
+        panel.setObjectName("assessmentPanel")
+        panel.setMinimumHeight(260)
+
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(8)
+
+        title = QLabel("Assessment Trial")
+        title.setObjectName("panelTitle")
+
+        self.task_select = QComboBox()
+        self.task_select.addItems(list(TASK_THRESHOLDS))
+        self.task_select.currentTextChanged.connect(lambda _text: self.update_assessment_context())
+        self.task_select.setMinimumWidth(250)
+
+        self.side_select = QComboBox()
+        self.side_select.addItems(SIDE_OPTIONS)
+        self.side_select.currentTextChanged.connect(lambda _text: self.update_asymmetry_display())
+        self.side_select.setMinimumWidth(126)
+
+        self.threshold_label = QLabel()
+        self.threshold_label.setObjectName("thresholdLabel")
+        self.threshold_label.setMinimumWidth(58)
+
+        self.start_button = QPushButton("Start")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.start_button.clicked.connect(self.start_trial)
+        self.stop_button.clicked.connect(self.stop_trial)
+
+        self.trial_state_label = QLabel("ready")
+        self.trial_state_label.setObjectName("trialState")
+        self.trial_state_label.setMinimumWidth(190)
+
+        self.trial_rms_metric = MiniMetric("RMS", "--")
+        self.trial_p95_metric = MiniMetric("P95", "--")
+        self.trial_peak_metric = MiniMetric("Peak", "--")
+        self.trial_outside_metric = MiniMetric("Outside", "--")
+        self.trial_velocity_metric = MiniMetric("Velocity", "--")
+        self.trial_recovery_metric = MiniMetric("Recovery", "--")
+        self.trial_asymmetry_metric = MiniMetric("Asymmetry", "--")
+        self.trial_samples_metric = MiniMetric("Samples", "0")
+
+        layout.addWidget(title, 0, 0, 1, 4)
+        layout.addWidget(self.task_select, 1, 0, 1, 2)
+        layout.addWidget(self.side_select, 1, 2)
+        layout.addWidget(self.threshold_label, 1, 3)
+        layout.addWidget(self.start_button, 2, 0)
+        layout.addWidget(self.stop_button, 2, 1)
+        layout.addWidget(self.trial_state_label, 2, 2, 1, 2)
+
+        metrics = [
+            self.trial_rms_metric,
+            self.trial_p95_metric,
+            self.trial_peak_metric,
+            self.trial_outside_metric,
+            self.trial_velocity_metric,
+            self.trial_recovery_metric,
+            self.trial_asymmetry_metric,
+            self.trial_samples_metric,
+        ]
+
+        for index, metric in enumerate(metrics):
+            layout.addWidget(metric, 3 + index // 4, index % 4)
+
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(2, 1)
+        layout.setColumnStretch(3, 1)
+
+        self.update_assessment_context()
+        return panel
+
+    def current_task(self):
+        # Return the currently selected standardized assessment task.
+        return self.task_select.currentText()
+
+    def current_side(self):
+        # Return the selected side for unilateral tasks.
+        return self.side_select.currentText()
+
+    def current_threshold(self):
+        # Look up the task-specific compensation threshold in degrees.
+        return TASK_THRESHOLDS.get(self.current_task(), 8.0)
+
+    def update_assessment_context(self):
+        # Refresh threshold and asymmetry text when the selected task changes.
+        self.threshold_label.setText(f"{self.current_threshold():.0f} deg")
+        self.update_asymmetry_display()
+
+    def reset_trial_display(self):
+        # Clear metric tiles before a new assessment recording starts.
+        self.trial_rms_metric.set_text("--")
+        self.trial_p95_metric.set_text("--")
+        self.trial_peak_metric.set_text("--")
+        self.trial_outside_metric.set_text("--")
+        self.trial_velocity_metric.set_text("--")
+        self.trial_recovery_metric.set_text("--")
+        self.trial_asymmetry_metric.set_text("--")
+        self.trial_samples_metric.set_text("0")
+
+    def start_trial(self):
+        # Begin collecting relative trunk-over-pelvis samples for one task trial.
+        self.trial_active = True
+        self.trial_start_time = time.time()
+        self.trial_samples = []
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.task_select.setEnabled(False)
+        self.side_select.setEnabled(False)
+        self.reset_trial_display()
+        self.trial_state_label.setText("recording")
+
+    def stop_trial(self):
+        # Stop recording, compute final metrics, and save the trial to CSV.
+        if not self.trial_active:
+            return
+
+        self.trial_active = False
+        metrics = calculate_trial_metrics(self.trial_samples, self.current_threshold())
+        task = self.current_task()
+        side = self.current_side()
+
+        self.side_results[(task, side)] = metrics
+        self.update_trial_display(metrics)
+        self.update_asymmetry_display()
+        append_trial_csv(task, side, self.current_threshold(), metrics)
+
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.task_select.setEnabled(True)
+        self.side_select.setEnabled(True)
+        self.trial_state_label.setText("saved to CSV")
+        self.trial_state_label.setToolTip(str(TRIAL_LOG_PATH))
+
+    def record_trial_sample(self, pose):
+        # Add the current pose to the active trial and refresh live metrics.
+        elapsed = time.time() - self.trial_start_time
+        relative_mag = math.hypot(pose.relative_roll, pose.relative_pitch)
+
+        self.trial_samples.append(
+            TrialSample(
+                elapsed_s=elapsed,
+                relative_roll=pose.relative_roll,
+                relative_pitch=pose.relative_pitch,
+                relative_mag=relative_mag,
+                score=pose.score,
+            )
+        )
+
+        metrics = calculate_trial_metrics(self.trial_samples, self.current_threshold())
+        self.update_trial_display(metrics)
+        self.trial_state_label.setText(f"recording {metrics.duration_s:.1f}s")
+
+    def update_trial_display(self, metrics):
+        # Show trial metrics using the same units that are written to CSV.
+        recovery = "--" if metrics.recovery_s is None else f"{metrics.recovery_s:.1f}s"
+        self.trial_rms_metric.set_text(f"{metrics.rms_deg:.1f} deg")
+        self.trial_p95_metric.set_text(f"{metrics.p95_deg:.1f} deg")
+        self.trial_peak_metric.set_text(f"{metrics.peak_deg:.1f} deg")
+        self.trial_outside_metric.set_text(f"{metrics.outside_pct:.0f}%")
+        self.trial_velocity_metric.set_text(f"{metrics.velocity_deg_s:.1f} deg/s")
+        self.trial_recovery_metric.set_text(recovery)
+        self.trial_samples_metric.set_text(str(metrics.sample_count))
+
+    def update_asymmetry_display(self):
+        # Compare left and right RMS values after both sides are recorded.
+        task = self.current_task()
+        left = self.side_results.get((task, "Left"))
+        right = self.side_results.get((task, "Right"))
+
+        if left and right:
+            asymmetry = abs(left.rms_deg - right.rms_deg)
+            self.trial_asymmetry_metric.set_text(f"{asymmetry:.1f} deg")
+        else:
+            self.trial_asymmetry_metric.set_text("--")
 
     def refresh(self):
         # Pull the newest pose and push values into each dashboard widget.
@@ -516,6 +934,9 @@ class Dashboard(QMainWindow):
         self.status.set_status(pose.status, pose.score)
         self.age_label.setText(f"sensor age {pose.age_ms} ms")
 
+        if self.trial_active:
+            self.record_trial_sample(pose)
+
 
 def status_color(score):
     # Shared color scale for good, warning, and feedback states.
@@ -531,6 +952,11 @@ def set_style(app):
     app.setStyleSheet(
         """
         QWidget#root {
+            background: #0b1020;
+            color: #e5e7eb;
+        }
+
+        QWidget#assessmentRoot {
             background: #0b1020;
             color: #e5e7eb;
         }
@@ -551,6 +977,18 @@ def set_style(app):
             border-radius: 8px;
         }
 
+        QFrame#assessmentPanel {
+            background: #111827;
+            border: 1px solid #253044;
+            border-radius: 8px;
+        }
+
+        QFrame#miniMetric {
+            background: #0f172a;
+            border: 1px solid #263244;
+            border-radius: 6px;
+        }
+
         QLabel#metricTitle {
             color: #94a3b8;
             font: 600 11px "Segoe UI";
@@ -564,6 +1002,60 @@ def set_style(app):
         QLabel#metricUnit {
             color: #64748b;
             font: 700 11px "Segoe UI";
+        }
+
+        QLabel#panelTitle {
+            color: #f8fafc;
+            font: 800 13px "Segoe UI";
+        }
+
+        QLabel#miniTitle {
+            color: #94a3b8;
+            font: 600 9px "Segoe UI";
+        }
+
+        QLabel#miniValue {
+            color: #f8fafc;
+            font: 800 12px "Segoe UI";
+        }
+
+        QLabel#thresholdLabel,
+        QLabel#trialState {
+            color: #cbd5e1;
+            font: 700 10px "Segoe UI";
+        }
+
+        QComboBox {
+            background: #0f172a;
+            color: #e5e7eb;
+            border: 1px solid #263244;
+            border-radius: 6px;
+            padding: 5px 8px;
+            font: 600 10px "Segoe UI";
+        }
+
+        QPushButton {
+            background: #2563eb;
+            color: #f8fafc;
+            border: 0;
+            border-radius: 6px;
+            padding: 6px 10px;
+            font: 800 10px "Segoe UI";
+        }
+
+        QPushButton:disabled {
+            background: #334155;
+            color: #94a3b8;
+        }
+
+        QPushButton#secondaryButton {
+            background: #172033;
+            color: #cbd5e1;
+            border: 1px solid #263244;
+        }
+
+        QPushButton#secondaryButton:hover {
+            background: #1e293b;
         }
         """
     )
