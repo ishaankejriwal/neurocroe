@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QFrame, QGridLayout, QLabel, QMainWindow, QWidget
 
 
+# Serial and dashboard configuration.
 # PORT = "/dev/cu.usbserial-5B1F0119041"
 PORT = "COM3"
 BAUD = 115200
@@ -20,6 +21,7 @@ MIN_CALIBRATION_SAMPLES = 20
 DISPLAY_RANGE_DEG = 30.0
 
 
+# Stores the current calibrated brace posture for the dashboard.
 @dataclass
 class Pose:
     back_roll: float = 0.0
@@ -33,12 +35,16 @@ class Pose:
     age_ms: int = 0
 
 
+# Runtime serial connection; initialized in main so imports stay safe.
 ser = None
+
+# Neutral calibration offsets captured while the brace is upright.
 back_zero_roll = 0.0
 back_zero_pitch = 0.0
 hip_zero_roll = 0.0
 hip_zero_pitch = 0.0
 
+# Last known posture values are retained when no new packet arrives.
 back_roll = 0.0
 back_pitch = 0.0
 hip_roll = 0.0
@@ -47,18 +53,23 @@ last_packet_time = 0.0
 
 
 def parse_frame(line):
+    # Ignore any serial output that is not the expected two-IMU frame.
     if "FRAME BACK" not in line or "| HIP" not in line:
         return None
 
+    # Extract numeric fields from the firmware text format.
     nums = re.findall(r"[-+]?\d+\.\d+|[-+]?\d+", line)
 
+    # A complete frame contains back and hip accelerometer/gyro/mag fields.
     if len(nums) < 20:
         return None
 
+    # Convert back accelerometer readings from milli-g to g.
     b_ax = float(nums[0]) / 1000.0
     b_ay = float(nums[1]) / 1000.0
     b_az = float(nums[2]) / 1000.0
 
+    # Convert hip accelerometer readings from milli-g to g.
     h_ax = float(nums[10]) / 1000.0
     h_ay = float(nums[11]) / 1000.0
     h_az = float(nums[12]) / 1000.0
@@ -67,6 +78,7 @@ def parse_frame(line):
 
 
 def read_latest_packet():
+    # Drain the serial backlog so the UI always uses the newest valid frame.
     latest = None
 
     while ser and ser.in_waiting:
@@ -82,6 +94,7 @@ def read_latest_packet():
     if not ser:
         return None
 
+    # If no backlog exists, do one short blocking read for fresh data.
     line = ser.readline().decode(errors="ignore").strip()
     if not line:
         return None
@@ -90,12 +103,14 @@ def read_latest_packet():
 
 
 def accel_roll_pitch(ax, ay, az):
+    # Estimate roll and pitch from acceleration relative to gravity.
     roll = math.atan2(ay, az)
     pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
     return math.degrees(roll), math.degrees(pitch)
 
 
 def wait_for_data():
+    # Block startup until the firmware is producing parseable frames.
     print("Waiting for FRAME data...")
 
     while True:
@@ -107,6 +122,7 @@ def wait_for_data():
 
 
 def calibrate():
+    # Capture upright baseline angles so live readings become relative posture.
     global back_zero_roll, back_zero_pitch, hip_zero_roll, hip_zero_pitch
 
     print()
@@ -119,6 +135,7 @@ def calibrate():
     samples = []
     start = time.time()
 
+    # Collect a short burst of samples while the brace is held still.
     while time.time() - start < CALIBRATION_SECONDS:
         packet = read_latest_packet()
 
@@ -139,6 +156,7 @@ def calibrate():
     h_rolls = []
     h_pitches = []
 
+    # Convert all calibration samples into roll/pitch angle lists.
     for b_ax, b_ay, b_az, h_ax, h_ay, h_az in samples:
         br, bp = accel_roll_pitch(b_ax, b_ay, b_az)
         hr, hp = accel_roll_pitch(h_ax, h_ay, h_az)
@@ -148,10 +166,13 @@ def calibrate():
         h_rolls.append(hr)
         h_pitches.append(hp)
 
+    # Average calibration angles to reduce noise in the neutral baseline.
     back_zero_roll = sum(b_rolls) / len(b_rolls)
     back_zero_pitch = sum(b_pitches) / len(b_pitches)
     hip_zero_roll = sum(h_rolls) / len(h_rolls)
     hip_zero_pitch = sum(h_pitches) / len(h_pitches)
+
+    # Clear any calibration-era packets before the live dashboard starts.
     ser.reset_input_buffer()
 
     print("Calibration complete.")
@@ -163,6 +184,7 @@ def calibrate():
 
 
 def compute_pose():
+    # Update posture state from the newest packet and derive compensation metrics.
     global back_roll, back_pitch, hip_roll, hip_pitch, last_packet_time
 
     packet = read_latest_packet()
@@ -174,16 +196,19 @@ def compute_pose():
         br, bp = accel_roll_pitch(b_ax, b_ay, b_az)
         hr, hp = accel_roll_pitch(h_ax, h_ay, h_az)
 
+        # Subtract neutral offsets so displayed values represent deviation.
         back_roll = br - back_zero_roll
         back_pitch = bp - back_zero_pitch
         hip_roll = hr - hip_zero_roll
         hip_pitch = hp - hip_zero_pitch
         last_packet_time = now
 
+    # Relative posture is the back movement after removing hip movement.
     relative_roll = back_roll - hip_roll
     relative_pitch = back_pitch - hip_pitch
     score = abs(relative_roll) + abs(relative_pitch)
 
+    # Convert the compensation score into a simple clinical status band.
     if score < 8:
         status = "GOOD"
     elif score < 15:
@@ -191,6 +216,7 @@ def compute_pose():
     else:
         status = "HAPTIC FEEDBACK"
 
+    # Sensor age helps diagnose connection stalls or packet delays.
     age_ms = int(max(0.0, now - last_packet_time) * 1000) if last_packet_time else 0
 
     return Pose(
@@ -207,6 +233,7 @@ def compute_pose():
 
 
 class MetricCard(QFrame):
+    # Compact card for one large numeric dashboard value.
     def __init__(self, title, unit="deg"):
         super().__init__()
         self.unit = unit
@@ -232,10 +259,12 @@ class MetricCard(QFrame):
         layout.addWidget(self.unit_label, 1, 1)
 
     def set_value(self, value):
+        # Keep numeric formatting consistent across live updates.
         self.value_label.setText(f"{value:.1f}")
 
 
 class LeanGauge(QWidget):
+    # Circular two-axis indicator for relative side and forward lean.
     def __init__(self):
         super().__init__()
         self._side = 0.0
@@ -243,11 +272,13 @@ class LeanGauge(QWidget):
         self.setMinimumHeight(240)
 
     def set_pose(self, side, forward):
+        # Clamp values so the marker always remains inside the gauge.
         self._side = max(-DISPLAY_RANGE_DEG, min(DISPLAY_RANGE_DEG, side))
         self._forward = max(-DISPLAY_RANGE_DEG, min(DISPLAY_RANGE_DEG, forward))
         self.update()
 
     def paintEvent(self, _event):
+        # Custom paint keeps the live gauge lightweight and fast.
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -259,18 +290,22 @@ class LeanGauge(QWidget):
         painter.setBrush(QColor("#111827"))
         painter.drawEllipse(center, radius, radius)
 
+        # Draw reference rings for quick visual magnitude estimation.
         painter.setPen(QPen(QColor("#263244"), 1))
         for scale in (0.33, 0.66, 1.0):
             r = radius * scale
             painter.drawEllipse(center, r, r)
 
+        # Draw center axes for side lean and forward lean.
         painter.setPen(QPen(QColor("#3a465a"), 1))
         painter.drawLine(center.x() - radius, center.y(), center.x() + radius, center.y())
         painter.drawLine(center.x(), center.y() - radius, center.x(), center.y() + radius)
 
+        # Map degrees into gauge coordinates.
         x = center.x() + (self._side / DISPLAY_RANGE_DEG) * radius
         y = center.y() - (self._forward / DISPLAY_RANGE_DEG) * radius
 
+        # Color the marker based on the same score thresholds as the status.
         color = status_color(abs(self._side) + abs(self._forward))
         painter.setBrush(QColor(color))
         painter.setPen(QPen(QColor("#ffffff"), 2))
@@ -287,6 +322,7 @@ class LeanGauge(QWidget):
 
 
 class BarMeter(QWidget):
+    # Horizontal signed bar for individual angle channels.
     def __init__(self, label):
         super().__init__()
         self.label = label
@@ -294,10 +330,12 @@ class BarMeter(QWidget):
         self.setMinimumHeight(30)
 
     def set_value(self, value):
+        # Clamp displayed values to the configured dashboard range.
         self.value = max(-DISPLAY_RANGE_DEG, min(DISPLAY_RANGE_DEG, value))
         self.update()
 
     def paintEvent(self, _event):
+        # Render a compact zero-centered bar without Matplotlib overhead.
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -309,6 +347,7 @@ class BarMeter(QWidget):
         painter.setBrush(QColor("#111827"))
         painter.drawRoundedRect(rect, 5, 5)
 
+        # Fill right for positive values and left for negative values.
         painter.setBrush(QColor(status_color(abs(self.value))))
         if self.value >= 0:
             fill_rect = rect.adjusted(int(rect.width() / 2), 0, 0, 0)
@@ -331,25 +370,30 @@ class BarMeter(QWidget):
 
 
 class ScoreRing(QWidget):
+    # Circular summary indicator for the total compensation score.
     def __init__(self):
         super().__init__()
         self._score = 0.0
         self.setMinimumSize(140, 140)
 
     def set_score(self, score):
+        # Store score and schedule a repaint on the next Qt frame.
         self._score = score
         self.update()
 
     def paintEvent(self, _event):
+        # Draw the score ring directly for smooth real-time updates.
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
         rect = self.rect().adjusted(14, 14, -14, -14)
         score_clamped = min(24.0, self._score)
 
+        # Draw the inactive ring background.
         painter.setPen(QPen(QColor("#172033"), 12, Qt.SolidLine, Qt.RoundCap))
         painter.drawArc(rect, 90 * 16, -360 * 16)
 
+        # Draw the active score arc using the current threshold color.
         painter.setPen(QPen(QColor(status_color(self._score)), 12, Qt.SolidLine, Qt.RoundCap))
         painter.drawArc(rect, 90 * 16, int(-360 * 16 * (score_clamped / 24.0)))
 
@@ -363,12 +407,14 @@ class ScoreRing(QWidget):
 
 
 class StatusPill(QLabel):
+    # Colored label that summarizes the current compensation state.
     def __init__(self):
         super().__init__("WAITING")
         self.setAlignment(Qt.AlignCenter)
         self.setObjectName("statusPill")
 
     def set_status(self, status, score):
+        # Update both text and color whenever the score band changes.
         self.setText(status)
         self.setStyleSheet(
             f"""
@@ -384,6 +430,7 @@ class StatusPill(QLabel):
 
 
 class Dashboard(QMainWindow):
+    # Main Qt window that arranges all live monitoring widgets.
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NeuroCore Live Brace Monitor")
@@ -394,6 +441,7 @@ class Dashboard(QMainWindow):
         root.setObjectName("root")
         self.setCentralWidget(root)
 
+        # Use a dense grid so the dashboard fits comfortably on a desktop screen.
         layout = QGridLayout(root)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setHorizontalSpacing(10)
@@ -422,6 +470,7 @@ class Dashboard(QMainWindow):
         layout.addWidget(self.relative_side, 3, 2)
         layout.addWidget(self.relative_forward, 3, 3)
 
+        # Individual channel meters mirror the original diagnostic bar chart.
         self.meters = [
             BarMeter("Back side lean"),
             BarMeter("Hip side tilt"),
@@ -440,11 +489,13 @@ class Dashboard(QMainWindow):
         layout.setColumnStretch(3, 1)
         layout.setRowStretch(5, 0)
 
+        # The Qt timer drives live updates without blocking the UI thread.
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(UPDATE_MS)
 
     def refresh(self):
+        # Pull the newest pose and push values into each dashboard widget.
         pose = compute_pose()
         values = [
             pose.back_roll,
@@ -467,6 +518,7 @@ class Dashboard(QMainWindow):
 
 
 def status_color(score):
+    # Shared color scale for good, warning, and feedback states.
     if score < 8:
         return "#22c55e"
     if score < 15:
@@ -475,6 +527,7 @@ def status_color(score):
 
 
 def set_style(app):
+    # Central stylesheet keeps visual polish separate from widget logic.
     app.setStyleSheet(
         """
         QWidget#root {
@@ -517,6 +570,7 @@ def set_style(app):
 
 
 def main():
+    # Open the serial port, calibrate, then start the Qt application loop.
     global ser
 
     ser = serial.Serial(PORT, BAUD, timeout=SERIAL_TIMEOUT)
@@ -535,6 +589,7 @@ def main():
     try:
         return app.exec()
     finally:
+        # Always release the serial port when the dashboard exits.
         ser.close()
         print("Serial closed.")
 
