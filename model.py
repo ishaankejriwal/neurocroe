@@ -1,4 +1,3 @@
-cat > two_imu_diagnostic.py <<'PY'
 import serial, time, re, math
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
